@@ -1,78 +1,127 @@
+"""Latency analytics endpoint for the eShopCo Vercel assignment."""
+
+from __future__ import annotations
+
 import json
+import math
+import os
 from pathlib import Path
-from typing import List, Optional
-import numpy as np
-from fastapi import FastAPI
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-app = FastAPI()
+app = FastAPI(title="eShopCo latency analytics")
 
-# Enable CORS for all origins (Required by assignment)
+# The dashboard can call this API from any website. The browser preflight is
+# handled by CORSMiddleware; the endpoint itself accepts POST requests.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Load telemetry data once when the serverless container starts
-DATA_PATH = Path(__file__).parent / "q-vercel-latency.json"
-with open(DATA_PATH, "r", encoding="utf-8") as f:
-    TELEMETRY_DATA = json.load(f)
+
+class AnalyticsRequest(BaseModel):
+    regions: list[str] = Field(..., description="Region names to summarize")
+    threshold_ms: float = Field(..., description="Latency breach threshold")
 
 
-class RequestPayload(BaseModel):
-    regions: List[str]
-    threshold_ms: float
+def _find_data_file() -> Path:
+    """Find the supplied bundle in common project locations or via env var."""
+    configured = os.environ.get("TELEMETRY_FILE")
+    candidates = ([Path(configured)] if configured else []) + [
+        Path(__file__).resolve().parent / "q-vercel-latency.json",
+        Path(__file__).resolve().parent.parent / "q-vercel-latency.json",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        "q-vercel-latency.json was not found. Put it in the project root or api/ folder."
+    )
 
 
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "eShopCo Latency Analytics API"}
+def _records(value: Any) -> list[dict[str, Any]]:
+    """Accept a JSON list or a common object wrapper containing that list."""
+    if isinstance(value, list):
+        return [row for row in value if isinstance(row, dict)]
+    if isinstance(value, dict):
+        for key in ("data", "records", "telemetry", "pings", "results"):
+            if isinstance(value.get(key), list):
+                return [row for row in value[key] if isinstance(row, dict)]
+        # Some bundles group rows by region: {"emea": [{...}], "apac": [...]}.
+        grouped: list[dict[str, Any]] = []
+        for region, rows in value.items():
+            if isinstance(rows, list):
+                grouped.extend(
+                    ({"region": region, **row} for row in rows if isinstance(row, dict))
+                )
+        if grouped:
+            return grouped
+    raise ValueError("The telemetry JSON must contain a list of records.")
+
+
+def _field(record: dict[str, Any], choices: tuple[str, ...]) -> Any:
+    normalized = {str(key).lower().replace("-", "_"): value for key, value in record.items()}
+    for key in choices:
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _percentile_95(values: list[float]) -> float:
+    """Return the interpolated 95th percentile (linear, as in common analytics tools)."""
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * 0.95
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
 @app.post("/")
-@app.post("/api")
-def analyze_telemetry(payload: RequestPayload):
-    requested_regions = set(payload.regions)
-    threshold = payload.threshold_ms
+def calculate_analytics(request: AnalyticsRequest) -> dict[str, Any]:
+    try:
+        with _find_data_file().open("r", encoding="utf-8") as telemetry_file:
+            rows = _records(json.load(telemetry_file))
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+    except (json.JSONDecodeError, ValueError) as error:
+        raise HTTPException(status_code=500, detail=f"Invalid telemetry bundle: {error}") from error
 
-    # Group telemetry records by region
-    region_records = {r: [] for r in requested_regions}
-    for record in TELEMETRY_DATA:
-        reg = record.get("region")
-        if reg in requested_regions:
-            region_records[reg].append(record)
+    response: dict[str, Any] = {}
+    for requested_region in request.regions:
+        region_rows = [
+            row for row in rows
+            if str(_field(row, ("region", "region_name", "location")) or "").lower()
+            == requested_region.lower()
+        ]
+        latencies: list[float] = []
+        uptimes: list[float] = []
+        for row in region_rows:
+            latency = _field(row, ("latency_ms", "latency", "response_time_ms", "response_time"))
+            uptime = _field(row, ("uptime", "uptime_pct", "uptime_percent", "availability"))
+            try:
+                if latency is not None:
+                    latencies.append(float(latency))
+                if uptime is not None:
+                    uptimes.append(float(uptime))
+            except (TypeError, ValueError):
+                continue
 
-    results = {}
+        if not latencies or not uptimes:
+            raise HTTPException(
+                status_code=422,
+                detail=f"No usable latency and uptime records found for region '{requested_region}'.",
+            )
 
-    for reg in payload.regions:
-        records = region_records.get(reg, [])
-        if not records:
-            results[reg] = {
-                "avg_latency": 0.0,
-                "p95_latency": 0.0,
-                "avg_uptime": 0.0,
-                "breaches": 0,
-            }
-            continue
-
-        latencies = [r["latency"] for r in records]
-        uptimes = [r["uptime"] for r in records]
-
-        # Compute required metrics
-        avg_lat = float(np.mean(latencies))
-        p95_lat = float(np.percentile(latencies, 95))
-        avg_up = float(np.mean(uptimes))
-        breach_count = int(sum(1 for l in latencies if l > threshold))
-
-        results[reg] = {
-            "avg_latency": avg_lat,
-            "p95_latency": p95_lat,
-            "avg_uptime": avg_up,
-            "breaches": breach_count,
+        response[requested_region] = {
+            "avg_latency": sum(latencies) / len(latencies),
+            "p95_latency": _percentile_95(latencies),
+            "avg_uptime": sum(uptimes) / len(uptimes),
+            "breaches": sum(value > request.threshold_ms for value in latencies),
         }
-
-    return results
+    return response
